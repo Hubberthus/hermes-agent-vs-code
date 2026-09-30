@@ -1,0 +1,28 @@
+diff --git a/lib/background-client.js b/lib/background-client.js
+index 7474379..69c998c 100644
+--- a/lib/background-client.js
++++ b/lib/background-client.js
+@@ -19,6 +19,7 @@ class BackgroundClient {
+     command,
+     args = ["acp"],
+     cwd,
++    env,
+     handlers = {},
+     storageDir,
+     extensionRoot,
+@@ -30,6 +31,7 @@ class BackgroundClient {
+     this.command = command;
+     this.args = args;
+     this.cwd = cwd;
++    this.env = env;
+     this.handlers = handlers;
+     this.storageDir = storageDir;
+     this.extensionRoot = extensionRoot;
+@@ -220,6 +222,7 @@ class BackgroundClient {
+     };
+     const env = {
+       ...process.env,
++      ...(this.env || {}),
+       HERMES_BACKGROUND_STORAGE: this.storageDir,
+       HERMES_BACKGROUND_TOKEN: token,
+       HERMES_BACKGROUND_SOCKET: socketPath,

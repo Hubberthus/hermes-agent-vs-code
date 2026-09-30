@@ -1,0 +1,247 @@
+diff --git a/background/host.js b/background/host.js
+index eabdb3c..b9d4593 100644
+--- a/background/host.js
++++ b/background/host.js
+@@ -18,8 +18,16 @@ const {
+ const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
+ const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+ 
++// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
++// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
++// so any pause longer than half a minute kills the host and the next prompt pays a
++// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
++// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
++// while making the restart rare instead of routine.
++const IDLE_EXIT_MS = 10 * 60 * 1000;
++
+ class BackgroundHost {
+-  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
++  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
+     this.storageDir = storageDir;
+     this.token = token;
+     this.instanceId = instanceId || crypto.randomUUID();
+@@ -389,7 +397,9 @@ class BackgroundHost {
+     const child = require("child_process").spawn(input.command, input.args || [], {
+       cwd: input.cwd,
+       env: { ...process.env, ...(input.env || {}) },
+-      shell: process.platform === "win32",
++      // See lib/acp-client.js: a shell on Windows opens a visible console window.
++      shell: false,
++      windowsHide: true,
+       stdio: ["pipe", "pipe", "pipe"]
+     });
+     this.cliProcesses.set(run.runId, { child, run });
+diff --git a/extension.js b/extension.js
+index 4febbdc..6d54292 100644
+--- a/extension.js
++++ b/extension.js
+@@ -46,7 +46,35 @@ Requirements:
+ - The response must not be empty.`;
+ const SOURCE_DIVERGENCE_FEEDBACK = "The source document changed during Diff approval. Do not retry this write in the current turn. In the final response, explain that the update was not applied because the user changed the original document.";
+ 
+-const HERMES_HOME = path.join(os.homedir(), ".hermes");
++// Resolve the Hermes home directory. Hermes itself uses %LOCALAPPDATA%\hermes on
++// Windows and ~/.hermes elsewhere, NOT always ~/.hermes. Hardcoding ~/.hermes made
++// the extension read a stub home: config.yaml, skills/, memories/ and sessions/ all
++// resolved against the wrong directory, so settings written by the extension never
++// reached the Hermes the CLI actually runs with.
++function resolveHermesHome() {
++  if (process.env.HERMES_HOME && process.env.HERMES_HOME.trim()) {
++    return process.env.HERMES_HOME.trim();
++  }
++  const candidates = process.platform === "win32"
++    ? [
++        process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "hermes"),
++        process.env.APPDATA && path.join(process.env.APPDATA, "hermes"),
++        path.join(os.homedir(), ".hermes")
++      ]
++    : [
++        process.env.XDG_DATA_HOME && path.join(process.env.XDG_DATA_HOME, "hermes"),
++        path.join(os.homedir(), ".local", "share", "hermes"),
++        path.join(os.homedir(), ".hermes")
++      ];
++  for (const candidate of candidates) {
++    if (candidate && fs.existsSync(path.join(candidate, "config.yaml"))) {
++      return candidate;
++    }
++  }
++  return candidates.find(Boolean) || path.join(os.homedir(), ".hermes");
++}
++
++const HERMES_HOME = resolveHermesHome();
+ const HERMES_DOC_PATHS = {
+   "SOUL.md": path.join(HERMES_HOME, "SOUL.md"),
+   "USER.md": path.join(HERMES_HOME, "memories", "USER.md"),
+@@ -633,7 +661,11 @@ class HermesSidebarProvider {
+       );
+       for (const { group, tab } of misplacedDocuments) {
+         const targetColumn = await this.ensureDocumentColumn();
+-        const opened = await this.openDocumentTab(tab, targetColumn);
++        // Background relocation (triggered by tab/focus events, not by a user
++        // click) must not steal keyboard focus: if the user is typing in the
++        // webview prompt, a focus grab here sends every subsequent keystroke to
++        // the editor. User-initiated opens keep the default preserveFocus:false.
++        const opened = await this.openDocumentTab(tab, targetColumn, { preserveFocus: true });
+         if (opened && group.tabs.includes(tab)) await vscode.window.tabGroups.close(tab, true);
+       }
+     } finally {
+@@ -641,13 +673,13 @@ class HermesSidebarProvider {
+     }
+   }
+ 
+-  async openDocumentTab(tab, viewColumn) {
++  async openDocumentTab(tab, viewColumn, { preserveFocus = false } = {}) {
+     const input = tab?.input;
+     if (input instanceof vscode.TabInputTextDiff || input instanceof vscode.TabInputNotebookDiff) {
+       try {
+         await vscode.commands.executeCommand("vscode.diff", input.original, input.modified, tab.label, {
+           preview: false,
+-          preserveFocus: false,
++          preserveFocus,
+           viewColumn
+         });
+         return true;
+@@ -657,7 +689,7 @@ class HermesSidebarProvider {
+       }
+     }
+     const uri = this.tabUri(tab);
+-    return uri ? this.openDocumentUri(uri, { preview: false, viewColumn }) : false;
++    return uri ? this.openDocumentUri(uri, { preview: false, viewColumn, preserveFocus }) : false;
+   }
+ 
+   async onMessage(message, panel) {
+@@ -865,7 +897,8 @@ class HermesSidebarProvider {
+         await persistModelReasoningEffort({
+           command,
+           model: selectedModel,
+-          effort: effectiveEffort
++          effort: effectiveEffort,
++          env: { HERMES_HOME }
+         });
+       } catch (error) {
+         vscode.window.showErrorMessage(`Unable to set Hermes reasoning effort: ${error.message}`);
+@@ -1006,12 +1039,12 @@ class HermesSidebarProvider {
+     vscode.window.showWarningMessage(`Hermes could not find the generated document: ${value}`);
+   }
+ 
+-  async openDocumentUri(uri, { preview = true, viewColumn } = {}) {
++  async openDocumentUri(uri, { preview = true, viewColumn, preserveFocus = false } = {}) {
+     const targetColumn = viewColumn ?? await this.ensureDocumentColumn();
+     try {
+       await vscode.commands.executeCommand("vscode.open", uri, {
+         preview,
+-        preserveFocus: false,
++        preserveFocus,
+         viewColumn: targetColumn
+       });
+       return true;
+@@ -1892,11 +1925,46 @@ class HermesSidebarProvider {
+     }
+   }
+ 
++  /**
++   * Build the argv for the ACP server.
++   *
++   * Reasoning effort is passed as a real CLI argument (`--reasoning <level>`)
++   * instead of being persisted into `agent.reasoning_overrides`. The config-writing
++   * path was unreliable: it required the spawned CLI to resolve the same Hermes home
++   * as the user, and a per-model override keyed by a provider-prefixed model id
++   * (`custom:<provider>:<model>`) did not always match what the runtime looks up.
++   * A launch argument has no such ambiguity — it is resolved for this process only.
++   *
++   * `--reasoning` is a TOP-LEVEL flag, so it must precede the `acp` subcommand:
++   * `hermes --reasoning high acp` (NOT `hermes acp --reasoning high`).
++   */
++  acpArgs() {
++    const args = [];
++    const effort = this.currentReasoningEffort();
++    if (effort) args.push("--reasoning", effort);
++    args.push("acp");
++    return args;
++  }
++
++  /** The most recently persisted effort for the active model, or "" when unset. */
++  currentReasoningEffort() {
++    const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
++    try {
++      const session = this.activeSession(this.activeSessionId);
++      const settings = session?.settings || {};
++      const model = settings.model || vscode.workspace.getConfiguration("hermesAgent").get("model", "");
++      const value = String(settings.reasoningByModel?.[model] || "").trim().toLowerCase();
++      if (allowed.has(value)) return value;
++    } catch { /* fall through to unset */ }
++    return "";
++  }
++
+   async startAcpClient(command) {
+     const client = new BackgroundClient({
+       command,
+-      args: ["acp"],
++      args: this.acpArgs(),
+       cwd: this.workspaceCwd(),
++      env: { HERMES_HOME },
+       storageDir: vscode.Uri.joinPath(this.context.globalStorageUri, "background-host").fsPath,
+       extensionRoot: this.context.extensionPath,
+       runtimeVersion: this.context.extension?.packageJSON?.version || "0.2.53",
+diff --git a/lib/acp-client.js b/lib/acp-client.js
+index e7be279..1ee0ab3 100644
+--- a/lib/acp-client.js
++++ b/lib/acp-client.js
+@@ -64,7 +64,12 @@ class AcpClient {
+         child = spawn(this.command, this.args, {
+           cwd: this.cwd,
+           env: { ...process.env, HERMES_ACCEPT_HOOKS: "1" },
+-          shell: process.platform === "win32",
++          // No shell: spawning through cmd.exe opens a visible console window on
++          // Windows, and the command here is an executable (hermes.exe) that Node
++          // resolves from PATH on its own. windowsHide is belt-and-braces for the
++          // paths where a shell is unavoidable. Matches lib/node-runtime.js.
++          shell: false,
++          windowsHide: true,
+           stdio: ["pipe", "pipe", "pipe"]
+         });
+       } catch (err) {
+diff --git a/lib/background-client.js b/lib/background-client.js
+index 7474379..69c998c 100644
+--- a/lib/background-client.js
++++ b/lib/background-client.js
+@@ -19,6 +19,7 @@ class BackgroundClient {
+     command,
+     args = ["acp"],
+     cwd,
++    env,
+     handlers = {},
+     storageDir,
+     extensionRoot,
+@@ -30,6 +31,7 @@ class BackgroundClient {
+     this.command = command;
+     this.args = args;
+     this.cwd = cwd;
++    this.env = env;
+     this.handlers = handlers;
+     this.storageDir = storageDir;
+     this.extensionRoot = extensionRoot;
+@@ -220,6 +222,7 @@ class BackgroundClient {
+     };
+     const env = {
+       ...process.env,
++      ...(this.env || {}),
+       HERMES_BACKGROUND_STORAGE: this.storageDir,
+       HERMES_BACKGROUND_TOKEN: token,
+       HERMES_BACKGROUND_SOCKET: socketPath,
+diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
+index 46e837a..5f9656e 100644
+--- a/lib/reasoning-config.js
++++ b/lib/reasoning-config.js
+@@ -39,7 +39,10 @@ function run(command, args, spawnImpl = spawn) {
+   return new Promise((resolve, reject) => {
+     const child = spawnImpl(command, args, {
+       env: process.env,
+-      shell: process.platform === "win32",
++      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
++      // the window if a shell ends up being used anyway.
++      shell: false,
++      windowsHide: true,
+       stdio: ["ignore", "pipe", "pipe"]
+     });
+     let stdout = "";

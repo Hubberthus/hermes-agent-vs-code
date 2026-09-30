@@ -18,8 +18,16 @@ const {
 const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
 const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
+// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
+// so any pause longer than half a minute kills the host and the next prompt pays a
+// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
+// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
+// while making the restart rare instead of routine.
+const IDLE_EXIT_MS = 10 * 60 * 1000;
+
 class BackgroundHost {
-  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
+  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
     this.storageDir = storageDir;
     this.token = token;
     this.instanceId = instanceId || crypto.randomUUID();
@@ -389,7 +397,8 @@ class BackgroundHost {
     const child = require("child_process").spawn(input.command, input.args || [], {
       cwd: input.cwd,
       env: { ...process.env, ...(input.env || {}) },
-      shell: process.platform === "win32",
+      // See lib/acp-client.js: a shell on Windows opens a visible console window.
+      shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"]
     });
