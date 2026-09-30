@@ -2030,6 +2030,8 @@ class HermesSidebarProvider {
           this.presentNextPermission();
         },
         onExit: (code, diagnosis) => {
+          // Drop any half-collected log record; a new client starts clean.
+          if (this._acpStderrState) this._acpStderrState.open = null;
           const status = client.intentionalStop ? "stopped" : "failed";
           if (this.acp === client) {
             for (const renderer of this.acpRenderers.values()) {
@@ -2057,33 +2059,8 @@ class HermesSidebarProvider {
           }
         },
         onStderr: line => {
-          // Only genuine failures reach the UI. Hermes logs INFO/WARNING
-          // chatter (auxiliary client health, payment fallbacks, registry
-          // scans) to stderr — surfacing those would leak internal noise
-          // like "marking openrouter unhealthy (payment / credit error)"
-          // into the working timeline. Require an explicit error marker.
-          if (/\[ERROR\]|\[CRITICAL\]|Traceback|^Error:|FATAL/i.test(line)) {
-            if (Number(client.suppressCancellationErrorsUntil || 0) > Date.now()) return;
-            const cancellingTurn = [...this.activeTurns.values()].find(turn =>
-              turn.client === client && turn.lifecycle.cancelled
-            );
-            if (cancellingTurn) return;
-            const matchingTurns = [...this.activeTurns.values()].filter(turn =>
-              turn.client === client && turn.assistantMessage.status === "running"
-            );
-            if (matchingTurns.length !== 1) {
-              vscode.window.showWarningMessage(`Hermes ACP transport error: ${line.slice(0, 300)}`);
-              return;
-            }
-            const turn = matchingTurns[0];
-            const last = turn.assistantMessage;
-            if (last && !last._acpStderrNoted) {
-              last._acpStderrNoted = true;
-              last.thinking.push({ kind: "error", title: "stderr", text: line.slice(0, 1000) });
-              this.post({ type: "thinkingUpdate", sessionId: turn.uiSessionId, messageId: last.id, thinking: last.thinking.map(step => ({ ...step })) });
-            }
-          }
-        }
+          this._absorbAcpStderr(client, line);
+        },
       }
     });
     this._startingAcp = client;
@@ -2103,6 +2080,88 @@ class HermesSidebarProvider {
     // webview immediately after ACP init.
     setTimeout(() => this.postState(), 200);
     return client;
+  }
+
+  /**
+   * Decide what a single line of ACP stderr means for the user.
+   *
+   * Hermes multiplexes its whole internal log onto the ACP process's stderr:
+   * plugin loads, auxiliary-provider health, MCP server chatter, and real
+   * failures alike. The ACP transport itself is healthy whenever these lines
+   * appear, so calling them "transport errors" misdirects the user into
+   * debugging the extension instead of the component that logged.
+   *
+   * Two changes from the previous behaviour:
+   *  1. Lines are attributed to their logger (mcp.*, hermes_cli.*, ...) and
+   *     labelled as a Hermes log message, not a transport error.
+   *  2. A log record spans many lines: the marker line plus its traceback
+   *     continuation lines. Those used to fire one popup per line, so a single
+   *     MCP parse failure produced two ("...Failed to parse JSONRPC..." and
+   *     then a bare "Traceback"). They are now buffered into one incident and
+   *     reported once, with the component that logged it.
+   */
+  _absorbAcpStderr(client, line) {
+    const text = String(line || "").trim();
+    if (!text) return;
+
+    // WARNING is deliberately excluded: Hermes logs plugin-load and provider
+    // health warnings on every start, and surfacing those would reintroduce
+    // exactly the noise this filter exists to remove.
+    const hasMarker = /\[(?:ERROR|CRITICAL)\]|^Error:|FATAL/i.test(text);
+    // "Traceback (most recent call last):" is the HEAD of a record, not the
+    // start of a new one - it belongs with the [ERROR] line above it. Only
+    // treat it as a record head when nothing is open (a bare traceback).
+    const isTracebackHead = /^Traceback \(most recent call last\):/i.test(text);
+    const state = this._acpStderrState || (this._acpStderrState = { open: null });
+    const isNewRecord = hasMarker || (isTracebackHead && !state.open);
+    // A traceback body line (indented frame, "File \"...", exception name)
+    // belongs to the record already open.
+    const isContinuation = !hasMarker && (isTracebackHead || /^\s{2,}\S|^\s*File \"|^[A-Za-z_.]*(Error|Exception)\b/.test(line));
+
+    if (isContinuation && state.open) {
+      if (state.open.lines.length < 12) state.open.lines.push(text);
+      return;
+    }
+    if (!isNewRecord) return;
+
+    // A new record closes the previous one.
+    if (state.open) this._reportAcpStderrIncident(client, state.open);
+    const logger = (text.match(/\[(?:ERROR|CRITICAL)\]\s+([a-z0-9_.]+):/i) || [])[1] || "";
+    state.open = { logger, head: text, lines: [text], at: Date.now() };
+    // A record with no continuation still has to be reported, so give it a
+    // short grace period to collect its traceback before flushing.
+    const open = state.open;
+    setTimeout(() => {
+      if (this._acpStderrState && this._acpStderrState.open === open) {
+        this._acpStderrState.open = null;
+        this._reportAcpStderrIncident(client, open);
+      }
+    }, 250);
+  }
+
+  /** Surface one buffered stderr record, as a toast or on the active turn. */
+  _reportAcpStderrIncident(client, incident) {
+    if (Number(client.suppressCancellationErrorsUntil || 0) > Date.now()) return;
+    const cancellingTurn = [...this.activeTurns.values()].find(turn =>
+      turn.client === client && turn.lifecycle.cancelled
+    );
+    if (cancellingTurn) return;
+
+    const detail = incident.lines.join("\n");
+    const source = incident.logger ? `Hermes ${incident.logger}:` : "Hermes:";
+    const matchingTurns = [...this.activeTurns.values()].filter(turn =>
+      turn.client === client && turn.assistantMessage.status === "running"
+    );
+    if (matchingTurns.length !== 1) {
+      vscode.window.showWarningMessage(`${source} ${detail.slice(0, 300)}`);
+      return;
+    }
+    const last = matchingTurns[0].assistantMessage;
+    if (last && !last._acpStderrNoted) {
+      last._acpStderrNoted = true;
+      last.thinking.push({ kind: "error", title: incident.logger || "hermes", text: detail.slice(0, 1000) });
+      this.post({ type: "thinkingUpdate", sessionId: matchingTurns[0].uiSessionId, messageId: last.id, thinking: last.thinking.map(step => ({ ...step })) });
+    }
   }
 
   presentNextPermission() {
