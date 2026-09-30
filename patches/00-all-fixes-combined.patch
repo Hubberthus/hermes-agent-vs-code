@@ -1,41 +1,21 @@
-diff --git a/background/host.js b/background/host.js
-index eabdb3c..b9d4593 100644
---- a/background/host.js
-+++ b/background/host.js
-@@ -18,8 +18,16 @@ const {
- const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
- const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
- 
-+// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
-+// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
-+// so any pause longer than half a minute kills the host and the next prompt pays a
-+// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
-+// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
-+// while making the restart rare instead of routine.
-+const IDLE_EXIT_MS = 10 * 60 * 1000;
-+
- class BackgroundHost {
--  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
-+  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
-     this.storageDir = storageDir;
-     this.token = token;
-     this.instanceId = instanceId || crypto.randomUUID();
-@@ -389,7 +397,9 @@ class BackgroundHost {
-     const child = require("child_process").spawn(input.command, input.args || [], {
-       cwd: input.cwd,
-       env: { ...process.env, ...(input.env || {}) },
--      shell: process.platform === "win32",
-+      // See lib/acp-client.js: a shell on Windows opens a visible console window.
-+      shell: false,
-+      windowsHide: true,
-       stdio: ["pipe", "pipe", "pipe"]
-     });
-     this.cliProcesses.set(run.runId, { child, run });
 diff --git a/extension.js b/extension.js
-index 4febbdc..6d54292 100644
+index 4febbdc..2ef24e6 100644
 --- a/extension.js
 +++ b/extension.js
-@@ -46,7 +46,35 @@ Requirements:
+@@ -27,6 +27,12 @@ const EDITOR_VIEW_TYPE = "hermesAgent.editorSession";
+ const SESSION_KEY = "hermesAgent.sessions";
+ const QUEUE_KEY = "hermesAgent.promptQueue";
+ const WORKSPACE_AGENT_STATE_KEY = "hermesAgent.workspaceAgentState";
++const LOG_CHANNEL_NAME = "Hermes Agent";
++// The backend answers a steer with an acknowledgement that arrives as ordinary
++// assistant text, because the steer is sent as a `session/prompt`. Suppress it
++// structurally rather than by exact wording, so backend rewording cannot leak
++// a control message into the transcript.
++const STEER_ACK_PATTERN = /^\s*(?:⏩\s*)?steer (?:queued|accepted|received|noted|delivered)\b/i;
+ const ACP_INITIALIZE_PARAMS = {
+   protocolVersion: 1,
+   clientCapabilities: {},
+@@ -46,7 +52,35 @@ Requirements:
  - The response must not be empty.`;
  const SOURCE_DIVERGENCE_FEEDBACK = "The source document changed during Diff approval. Do not retry this write in the current turn. In the final response, explain that the update was not applied because the user changed the original document.";
  
@@ -72,7 +52,43 @@ index 4febbdc..6d54292 100644
  const HERMES_DOC_PATHS = {
    "SOUL.md": path.join(HERMES_HOME, "SOUL.md"),
    "USER.md": path.join(HERMES_HOME, "memories", "USER.md"),
-@@ -633,7 +661,11 @@ class HermesSidebarProvider {
+@@ -162,6 +196,7 @@ function activate(context) {
+   _activeProvider = provider;
+   void provider.ensureBackgroundRecovery().finally(() => provider.restoreWorkspaceAgentState());
+   context.subscriptions.push(
++    provider.logChannel,
+     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
+       webviewOptions: { retainContextWhenHidden: true }
+     }),
+@@ -214,6 +249,10 @@ class HermesSidebarProvider {
+     this.context = context;
+     this.disposing = false;
+     this.view = undefined;
++    // Diagnostic channel. The extension had no logging sink at all, which is
++    // why a stuck turn left no trace of its own state: only the backend's
++    // stderr was ever visible. Visible via Output → "Hermes Agent".
++    this.logChannel = vscode.window.createOutputChannel(LOG_CHANNEL_NAME);
+     this.panels = new Set();
+     this.sessions = this.loadSessions();
+     this.workspaceAgentState = normalizeWorkspaceAgentState(this.context.workspaceState.get(WORKSPACE_AGENT_STATE_KEY));
+@@ -264,6 +303,16 @@ class HermesSidebarProvider {
+     this._nodeRuntimeErrorKey = "";
+   }
+ 
++  /** Append a timestamped line to the "Hermes Agent" output channel. */
++  log(message) {
++    try {
++      const stamp = new Date().toISOString();
++      this.logChannel?.appendLine(`[${stamp}] ${message}`);
++    } catch {
++      // Logging must never break a turn.
++    }
++  }
++
+   resolveWebviewView(view) {
+     this.view = view;
+     this.configureWebview(view.webview);
+@@ -633,7 +682,11 @@ class HermesSidebarProvider {
        );
        for (const { group, tab } of misplacedDocuments) {
          const targetColumn = await this.ensureDocumentColumn();
@@ -85,7 +101,7 @@ index 4febbdc..6d54292 100644
          if (opened && group.tabs.includes(tab)) await vscode.window.tabGroups.close(tab, true);
        }
      } finally {
-@@ -641,13 +673,13 @@ class HermesSidebarProvider {
+@@ -641,13 +694,13 @@ class HermesSidebarProvider {
      }
    }
  
@@ -101,7 +117,7 @@ index 4febbdc..6d54292 100644
            viewColumn
          });
          return true;
-@@ -657,7 +689,7 @@ class HermesSidebarProvider {
+@@ -657,7 +710,7 @@ class HermesSidebarProvider {
        }
      }
      const uri = this.tabUri(tab);
@@ -110,7 +126,7 @@ index 4febbdc..6d54292 100644
    }
  
    async onMessage(message, panel) {
-@@ -865,7 +897,8 @@ class HermesSidebarProvider {
+@@ -865,7 +918,8 @@ class HermesSidebarProvider {
          await persistModelReasoningEffort({
            command,
            model: selectedModel,
@@ -120,7 +136,7 @@ index 4febbdc..6d54292 100644
          });
        } catch (error) {
          vscode.window.showErrorMessage(`Unable to set Hermes reasoning effort: ${error.message}`);
-@@ -1006,12 +1039,12 @@ class HermesSidebarProvider {
+@@ -1006,12 +1060,12 @@ class HermesSidebarProvider {
      vscode.window.showWarningMessage(`Hermes could not find the generated document: ${value}`);
    }
  
@@ -135,7 +151,79 @@ index 4febbdc..6d54292 100644
          viewColumn: targetColumn
        });
        return true;
-@@ -1892,11 +1925,46 @@ class HermesSidebarProvider {
+@@ -1489,16 +1543,24 @@ class HermesSidebarProvider {
+     session.messages.push(userMessage, assistantMessage);
+     session.updatedAt = Date.now();
+     renderer.continueWith(assistantMessage);
+-    renderer.ignoreNextAssistantText(/^(?:⏩\s*)?Steer queued for the active turn:/);
++    renderer.ignoreNextAssistantText(STEER_ACK_PATTERN);
+     turn.assistantMessage = assistantMessage;
++    // Track this continuation so the owning turn can finalize it. Without this
++    // the message keeps status "running" forever and the composer stays locked.
++    if (Array.isArray(turn.pendingSteerMessages)) {
++      turn.pendingSteerMessages.push(assistantMessage);
++    }
++    this.log(`steer: queued continuation for turn ${turn.acpSessionId} (session ${sessionId})`);
+     await this.saveSessions();
+     this.postState();
+     try {
+-      await turn.client.request("session/prompt", {
++      const steerResult = await turn.client.request("session/prompt", {
+         sessionId: turn.acpSessionId,
+         prompt: [{ type: "text", text: `/steer ${prompt}` }]
+       });
++      this.log(`steer: backend answered (status=${assistantMessage.status}, stopReason=${steerResult?.stopReason ?? "n/a"})`);
+     } catch (error) {
++      this.log(`steer: request failed: ${error?.message || error}`);
+       assistantMessage.thinking.push({ kind: "error", title: "Steer unavailable", text: error.message || String(error), finalized: true });
+       await this.saveSessions();
+       this.postState();
+@@ -1587,6 +1649,12 @@ class HermesSidebarProvider {
+     let acpSessionId;
+     let renderer;
+     let detached = false;
++    // The message this turn is responsible for finalizing. A steer swaps
++    // turn.assistantMessage to its own continuation message, so the turn must
++    // remember which message it owns instead of reading that mutable field at
++    // completion time.
++    const turnMessage = assistantMessage;
++    turn.pendingSteerMessages = [];
+     const backgroundRunId = assistantMessage.backgroundRunId || id();
+     assistantMessage.backgroundRunId = backgroundRunId;
+     await this.saveSessions();
+@@ -1655,7 +1723,11 @@ class HermesSidebarProvider {
+       if (finishReason?.usage) session.usage = finishReason.usage;
+ 
+       if (lifecycle.cancelled) throw new TurnCancelledError();
+-      if (turn.assistantMessage.status === "running") {
++      this.log(`turn: ${acpSessionId} prompt returned (stopReason=${finishReason?.stopReason ?? "n/a"}); owned=${turnMessage?.status} renderer=${renderer.currentStatus?.() ?? "n/a"} steers=${turn.pendingSteerMessages?.length ?? 0}`);
++      // Finalize the message this turn owns, captured above. Do not read
++      // turn.assistantMessage here: a steer replaces it mid-flight, and its
++      // status would then describe a message this turn is not responsible for.
++      if (turnMessage && turnMessage.status === "running") {
+         const status = finishReason && finishReason.stopReason === "refusal" ? "failed" : "done";
+         const finalization = renderer.finalize(status);
+         if (status === "done" && finalization && finalization.needsFinalAnswer && !finishReason?._backgroundFinalAnswerHandled) {
+@@ -1669,9 +1741,17 @@ class HermesSidebarProvider {
+             if (lifecycle.cancelled) throw new TurnCancelledError();
+           }
+           if (lifecycle.cancelled) throw new TurnCancelledError();
+-          if (turn.assistantMessage.status === "running") renderer.finalize("done");
++          if (turnMessage.status === "running") renderer.finalize("done");
+         }
+       }
++      // A steer whose continuation is still open would otherwise leave its
++      // message "running" forever, which is what froze the composer.
++      const steered = Array.isArray(turn.pendingSteerMessages) && turn.pendingSteerMessages.length
++        ? turn.pendingSteerMessages.splice(0)
++        : [];
++      if (steered.length && renderer.finalizeCurrent) {
++        renderer.finalizeCurrent("done");
++      }
+     } catch (error) {
+       if (error?.code === "HERMES_BACKGROUND_DISCONNECTED") {
+         if (this.disposing) {
+@@ -1892,11 +1972,46 @@ class HermesSidebarProvider {
      }
    }
  
@@ -183,6 +271,14 @@ index 4febbdc..6d54292 100644
        storageDir: vscode.Uri.joinPath(this.context.globalStorageUri, "background-host").fsPath,
        extensionRoot: this.context.extensionPath,
        runtimeVersion: this.context.extension?.packageJSON?.version || "0.2.53",
+@@ -3187,6 +3302,7 @@ class HermesSidebarProvider {
+     if (this._disposePromise) return this._disposePromise;
+     this.disposing = true;
+     this._disposePromise = (async () => {
++      this.log("dispose: provider shutting down");
+       this.clearPermissionReminder();
+       this.permissionSessionGrants.clear();
+       this.permissionBatchState.clear();
 diff --git a/lib/acp-client.js b/lib/acp-client.js
 index e7be279..1ee0ab3 100644
 --- a/lib/acp-client.js
@@ -201,6 +297,55 @@ index e7be279..1ee0ab3 100644
            stdio: ["pipe", "pipe", "pipe"]
          });
        } catch (err) {
+diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
+index 46e837a..5f9656e 100644
+--- a/lib/reasoning-config.js
++++ b/lib/reasoning-config.js
+@@ -39,7 +39,10 @@ function run(command, args, spawnImpl = spawn) {
+   return new Promise((resolve, reject) => {
+     const child = spawnImpl(command, args, {
+       env: process.env,
+-      shell: process.platform === "win32",
++      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
++      // the window if a shell ends up being used anyway.
++      shell: false,
++      windowsHide: true,
+       stdio: ["ignore", "pipe", "pipe"]
+     });
+     let stdout = "";
+diff --git a/background/host.js b/background/host.js
+index eabdb3c..b9d4593 100644
+--- a/background/host.js
++++ b/background/host.js
+@@ -18,8 +18,16 @@ const {
+ const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
+ const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+ 
++// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
++// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
++// so any pause longer than half a minute kills the host and the next prompt pays a
++// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
++// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
++// while making the restart rare instead of routine.
++const IDLE_EXIT_MS = 10 * 60 * 1000;
++
+ class BackgroundHost {
+-  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
++  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
+     this.storageDir = storageDir;
+     this.token = token;
+     this.instanceId = instanceId || crypto.randomUUID();
+@@ -389,7 +397,9 @@ class BackgroundHost {
+     const child = require("child_process").spawn(input.command, input.args || [], {
+       cwd: input.cwd,
+       env: { ...process.env, ...(input.env || {}) },
+-      shell: process.platform === "win32",
++      // See lib/acp-client.js: a shell on Windows opens a visible console window.
++      shell: false,
++      windowsHide: true,
+       stdio: ["pipe", "pipe", "pipe"]
+     });
+     this.cliProcesses.set(run.runId, { child, run });
 diff --git a/lib/background-client.js b/lib/background-client.js
 index 7474379..69c998c 100644
 --- a/lib/background-client.js
@@ -229,19 +374,65 @@ index 7474379..69c998c 100644
        HERMES_BACKGROUND_STORAGE: this.storageDir,
        HERMES_BACKGROUND_TOKEN: token,
        HERMES_BACKGROUND_SOCKET: socketPath,
-diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
-index 46e837a..5f9656e 100644
---- a/lib/reasoning-config.js
-+++ b/lib/reasoning-config.js
-@@ -39,7 +39,10 @@ function run(command, args, spawnImpl = spawn) {
-   return new Promise((resolve, reject) => {
-     const child = spawnImpl(command, args, {
-       env: process.env,
--      shell: process.platform === "win32",
-+      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
-+      // the window if a shell ends up being used anyway.
-+      shell: false,
-+      windowsHide: true,
-       stdio: ["ignore", "pipe", "pipe"]
-     });
-     let stdout = "";
+diff --git a/lib/acp-render.js b/lib/acp-render.js
+index 3d7ff44..b55474a 100644
+--- a/lib/acp-render.js
++++ b/lib/acp-render.js
+@@ -574,6 +574,48 @@ function createAcpRenderer({ assistantMessage, post, session }) {
+     return handleEvent({ type, turnId: session.id }, { type });
+   }
+ 
++  // Close whichever message the renderer currently points at, regardless of how
++  // that pointer moved. Used for a steer continuation: continueWith() repoints
++  // assistantMessage at the continuation, and the continuation has no turn of
++  // its own to finalize it, so it would sit at "running" forever and keep the
++  // composer locked.
++  //
++  // completeTurn() returns { needsFinalAnswer: true } and deliberately leaves
++  // the status alone when the message has no answer text yet — the caller is
++  // then expected to re-prompt and finalize a second time. That contract cannot
++  // be honoured here (there is no second call and no further prompt to send),
++  // so this closes the turn outright.
++  function finalizeCurrent(status = "done") {
++    if (assistantMessage.status !== "running") return { needsFinalAnswer: false };
++    const result = finalize(status);
++    // finalize() may have deferred; force a terminal state so nothing is left
++    // "running" with no owner.
++    if (assistantMessage.status === "running") {
++      if (status === "done") {
++        if (!isValidAnswer(assistantMessage.text)) {
++          appendAnswer(EMPTY_ANSWER_FALLBACK, "fallback");
++        }
++        finishActions("completed");
++        assistantMessage.status = "done";
++      } else if (status === "stopped") {
++        finishActions("completed");
++        assistantMessage.status = "stopped";
++      } else {
++        finishActions("failed");
++        assistantMessage.status = "failed";
++      }
++      assistantMessage.finishedAt = finishSteps();
++      state.phase = "completed";
++      pushThinking();
++    }
++    return { needsFinalAnswer: false, ...(result || {}) };
++  }
++
++  /** Status of the message the renderer currently points at (diagnostics). */
++  function currentStatus() {
++    return assistantMessage.status;
++  }
++
+   function beginFinalAnswerOnly() {
+     clearPendingText();
+     state.finalAnswerOnly = true;
+@@ -606,7 +648,7 @@ function createAcpRenderer({ assistantMessage, post, session }) {
+     state.ignoredAssistantText = undefined;
+   }
+ 
+-  return { onSessionUpdate, handleEvent, finalize, beginFinalAnswerOnly, continueWith, ignoreNextAssistantText };
++  return { onSessionUpdate, handleEvent, finalize, finalizeCurrent, currentStatus, beginFinalAnswerOnly, continueWith, ignoreNextAssistantText };
+ }
+ 
+ module.exports = { ACTION_LABELS, createAcpRenderer, naturalTitle, normalizeHermesEvent };

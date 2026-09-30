@@ -1,67 +1,75 @@
-# Local fixes — Hermes Agent VS Code extension
+# Fixes against Hermes Agent for VS Code 0.2.53
 
-Applied against upstream `a8b2f8f` ("release: sync Hermes Agent 0.2.53 source").
+Each patch applies cleanly, on its own, to the upstream release commit
+`a8b2f8f` ("release: sync Hermes Agent 0.2.53 source").
 
-Apply the combined patch, or the numbered shards in order:
+    git apply patches/00-all-fixes-combined.patch      # everything
+    git apply patches/01-hermes-home-and-lifecycle.patch   # or one fix at a time
 
-```sh
-git apply patches/00-all-fixes-combined.patch
-# or, equivalently:
-git apply patches/01-hermes-home-and-lifecycle.patch \
-          patches/02-no-shell-and-idle-exit.patch \
-          patches/03-host-no-shell-and-idle.patch \
-          patches/04-background-client-idle.patch
-```
+The shards partition the change exactly: their combined diff equals the
+combined patch, with no overlap and no gap. Only these six source files
+change; nothing under `patches/` is part of any patch.
 
-The shards form a **partition**: every changed file appears in exactly one
-shard, and the shards together equal the combined patch (verified: 98 added
-lines either way). They can be applied independently and in any order.
+## What each patch fixes
 
-## Shards
+**01-hermes-home-and-lifecycle** — `extension.js`
 
-### 01-hermes-home-and-lifecycle — `extension.js`
+`resolveHermesHome()` replaces a hard-coded `~/.hermes`. The extension
+previously looked for the backend in a fixed location, which is wrong on
+Windows (where Hermes lives under `%LOCALAPPDATA%`) and on any install that
+sets its own home. Also tightens the turn lifecycle so a turn cannot be left
+without an owner.
 
-Two separate problems in one file.
+**02-no-shell-and-idle-exit** — `lib/acp-client.js`, `lib/reasoning-config.js`
 
-**Hermes home resolution.** `HERMES_HOME` was hardcoded to `~/.hermes`.
-Hermes itself uses `%LOCALAPPDATA%\hermes` on Windows and
-`~/.local/share/hermes` on Linux. Reading a stub home meant `config.yaml`,
-`skills/`, `memories/` and `sessions/` all resolved against the wrong
-directory, so anything the extension wrote never reached the Hermes the CLI
-actually runs with. Now resolved by `resolveHermesHome()`: an explicit
-`HERMES_HOME` wins, otherwise the first platform candidate that actually
-contains a `config.yaml`.
+Spawns the backend with `shell: false` and `windowsHide: true`. Routing the
+command through a shell meant arguments were re-parsed by `cmd.exe`, so any
+path containing a space or a metacharacter could be mangled, and a console
+window flashed on every launch.
 
-**Console window.** The ACP backend was spawned through a shell on Windows,
-which opens a visible console window on every start.
+**03-host-no-shell-and-idle** — `background/host.js`
 
-### 02-no-shell-and-idle-exit — `lib/acp-client.js`, `lib/reasoning-config.js`
+Shortens the host's idle lifetime from 30 s to 10 min. At 30 s the background
+host exited between prompts, so each message paid a cold-start cost and any
+in-flight work could be cut off.
 
-`shell: false` plus `windowsHide: true` on both spawns. The commands are real
-executables that Node resolves from `PATH` on its own; routing them through
-`cmd.exe` only re-parses the arguments and flashes a console window.
+**04-background-client-idle** — `lib/background-client.js`
 
-### 03-host-no-shell-and-idle — `background/host.js`
+Keeps the client's idle expectation in step with the host, so the client does
+not decide the host has gone away while it is in fact still alive.
 
-Same `shell: false` / `windowsHide: true` change for the background host.
+**05-steer-continuation-finalize** — `lib/acp-render.js`
 
-Also raises the idle-exit threshold from 30 s to 10 min. Upstream's 30 s is
-shorter than the ACP backend's own cold start (measured ~13 s: MCP server
-handshakes plus ~62 plugin registrations), so any pause longer than half a
-minute killed the host and the next prompt paid a full backend restart. The
-anti-orphan intent is preserved — an abandoned host still reaps itself, and
-`_hasActiveWork()` still blocks exit while a task runs.
+Fixes the steer button deadlocking the conversation. Steering replaces the
+turn's assistant message with a continuation and marks the original
+`continued`. The completion guard then read the *new* message, which no longer
+matched, so the turn was never finalized and the continuation stayed `running`
+forever. Because `running` is what drives `sessionIsRunning`, the composer
+locked up permanently and no further message could be sent.
 
-### 04-background-client-idle — `lib/background-client.js`
+`finalizeCurrent()` closes whichever message the renderer currently points at,
+and forces a terminal state rather than deferring. `completeTurn()` legitimately
+returns `needsFinalAnswer: true` and leaves a message `running` when it has no
+answer text yet, expecting the caller to prompt again and finalize a second
+time; a steer continuation has no such second call, so that contract cannot be
+honoured and the turn is closed outright. The ordinary turn path is unchanged.
 
-Client-side counterpart to the idle-exit change.
+## Verifying
 
-## Notes
+`steer-repro.js` and `turn-regression.js` drive `lib/acp-render.js` directly
+under plain Node, with no VS Code involved.
 
-- `extension.js` also gains `preserveFocus: true` on the background tab
-  relocation path, so moving a misplaced editor tab cannot steal the keyboard
-  focus from the chat input. This belongs to shard 01 because it is a change
-  to the same file; it is not a separate shard.
-- These patches cover the fixes only. They deliberately exclude diagnostic
-  instrumentation (raw ACP stderr logging) and any internal notes or plans,
-  so the set can be applied to upstream without carrying local context.
+    node steer-repro.js base-check   # red on upstream: steer stays "running"
+    node steer-repro.js fixed        # green after patch 05
+
+The regression harness additionally pins the behaviours these patches must not
+break: a normal turn still finalizes to `done` in one call, an answer-less turn
+still defers with `needsFinalAnswer: true`, and a failed turn still reports
+`failed`.
+
+Note that `npm test` and `npm run lint` cannot run on upstream as published:
+`package.json` still references 24 files under `test/`, but the directory was
+deleted in `8a5d247` ("Delete test directory"). Syntax-check the sources
+directly instead:
+
+    for f in extension.js background/*.js lib/*.js media/*.js; do node --check "$f"; done

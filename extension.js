@@ -27,6 +27,12 @@ const EDITOR_VIEW_TYPE = "hermesAgent.editorSession";
 const SESSION_KEY = "hermesAgent.sessions";
 const QUEUE_KEY = "hermesAgent.promptQueue";
 const WORKSPACE_AGENT_STATE_KEY = "hermesAgent.workspaceAgentState";
+const LOG_CHANNEL_NAME = "Hermes Agent";
+// The backend answers a steer with an acknowledgement that arrives as ordinary
+// assistant text, because the steer is sent as a `session/prompt`. Suppress it
+// structurally rather than by exact wording, so backend rewording cannot leak
+// a control message into the transcript.
+const STEER_ACK_PATTERN = /^\s*(?:⏩\s*)?steer (?:queued|accepted|received|noted|delivered)\b/i;
 const ACP_INITIALIZE_PARAMS = {
   protocolVersion: 1,
   clientCapabilities: {},
@@ -190,6 +196,7 @@ function activate(context) {
   _activeProvider = provider;
   void provider.ensureBackgroundRecovery().finally(() => provider.restoreWorkspaceAgentState());
   context.subscriptions.push(
+    provider.logChannel,
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
       webviewOptions: { retainContextWhenHidden: true }
     }),
@@ -242,6 +249,10 @@ class HermesSidebarProvider {
     this.context = context;
     this.disposing = false;
     this.view = undefined;
+    // Diagnostic channel. The extension had no logging sink at all, which is
+    // why a stuck turn left no trace of its own state: only the backend's
+    // stderr was ever visible. Visible via Output → "Hermes Agent".
+    this.logChannel = vscode.window.createOutputChannel(LOG_CHANNEL_NAME);
     this.panels = new Set();
     this.sessions = this.loadSessions();
     this.workspaceAgentState = normalizeWorkspaceAgentState(this.context.workspaceState.get(WORKSPACE_AGENT_STATE_KEY));
@@ -290,6 +301,16 @@ class HermesSidebarProvider {
     this._ensureAcpPromise = undefined;
     this._nodeRuntimePromise = undefined;
     this._nodeRuntimeErrorKey = "";
+  }
+
+  /** Append a timestamped line to the "Hermes Agent" output channel. */
+  log(message) {
+    try {
+      const stamp = new Date().toISOString();
+      this.logChannel?.appendLine(`[${stamp}] ${message}`);
+    } catch {
+      // Logging must never break a turn.
+    }
   }
 
   resolveWebviewView(view) {
@@ -1522,16 +1543,24 @@ class HermesSidebarProvider {
     session.messages.push(userMessage, assistantMessage);
     session.updatedAt = Date.now();
     renderer.continueWith(assistantMessage);
-    renderer.ignoreNextAssistantText(/^(?:⏩\s*)?Steer queued for the active turn:/);
+    renderer.ignoreNextAssistantText(STEER_ACK_PATTERN);
     turn.assistantMessage = assistantMessage;
+    // Track this continuation so the owning turn can finalize it. Without this
+    // the message keeps status "running" forever and the composer stays locked.
+    if (Array.isArray(turn.pendingSteerMessages)) {
+      turn.pendingSteerMessages.push(assistantMessage);
+    }
+    this.log(`steer: queued continuation for turn ${turn.acpSessionId} (session ${sessionId})`);
     await this.saveSessions();
     this.postState();
     try {
-      await turn.client.request("session/prompt", {
+      const steerResult = await turn.client.request("session/prompt", {
         sessionId: turn.acpSessionId,
         prompt: [{ type: "text", text: `/steer ${prompt}` }]
       });
+      this.log(`steer: backend answered (status=${assistantMessage.status}, stopReason=${steerResult?.stopReason ?? "n/a"})`);
     } catch (error) {
+      this.log(`steer: request failed: ${error?.message || error}`);
       assistantMessage.thinking.push({ kind: "error", title: "Steer unavailable", text: error.message || String(error), finalized: true });
       await this.saveSessions();
       this.postState();
@@ -1620,6 +1649,12 @@ class HermesSidebarProvider {
     let acpSessionId;
     let renderer;
     let detached = false;
+    // The message this turn is responsible for finalizing. A steer swaps
+    // turn.assistantMessage to its own continuation message, so the turn must
+    // remember which message it owns instead of reading that mutable field at
+    // completion time.
+    const turnMessage = assistantMessage;
+    turn.pendingSteerMessages = [];
     const backgroundRunId = assistantMessage.backgroundRunId || id();
     assistantMessage.backgroundRunId = backgroundRunId;
     await this.saveSessions();
@@ -1688,7 +1723,11 @@ class HermesSidebarProvider {
       if (finishReason?.usage) session.usage = finishReason.usage;
 
       if (lifecycle.cancelled) throw new TurnCancelledError();
-      if (turn.assistantMessage.status === "running") {
+      this.log(`turn: ${acpSessionId} prompt returned (stopReason=${finishReason?.stopReason ?? "n/a"}); owned=${turnMessage?.status} renderer=${renderer.currentStatus?.() ?? "n/a"} steers=${turn.pendingSteerMessages?.length ?? 0}`);
+      // Finalize the message this turn owns, captured above. Do not read
+      // turn.assistantMessage here: a steer replaces it mid-flight, and its
+      // status would then describe a message this turn is not responsible for.
+      if (turnMessage && turnMessage.status === "running") {
         const status = finishReason && finishReason.stopReason === "refusal" ? "failed" : "done";
         const finalization = renderer.finalize(status);
         if (status === "done" && finalization && finalization.needsFinalAnswer && !finishReason?._backgroundFinalAnswerHandled) {
@@ -1702,8 +1741,16 @@ class HermesSidebarProvider {
             if (lifecycle.cancelled) throw new TurnCancelledError();
           }
           if (lifecycle.cancelled) throw new TurnCancelledError();
-          if (turn.assistantMessage.status === "running") renderer.finalize("done");
+          if (turnMessage.status === "running") renderer.finalize("done");
         }
+      }
+      // A steer whose continuation is still open would otherwise leave its
+      // message "running" forever, which is what froze the composer.
+      const steered = Array.isArray(turn.pendingSteerMessages) && turn.pendingSteerMessages.length
+        ? turn.pendingSteerMessages.splice(0)
+        : [];
+      if (steered.length && renderer.finalizeCurrent) {
+        renderer.finalizeCurrent("done");
       }
     } catch (error) {
       if (error?.code === "HERMES_BACKGROUND_DISCONNECTED") {
@@ -3320,6 +3367,7 @@ class HermesSidebarProvider {
     if (this._disposePromise) return this._disposePromise;
     this.disposing = true;
     this._disposePromise = (async () => {
+      this.log("dispose: provider shutting down");
       this.clearPermissionReminder();
       this.permissionSessionGrants.clear();
       this.permissionBatchState.clear();
