@@ -2029,7 +2029,7 @@ class HermesSidebarProvider {
           this.permissionQueue.push(pending);
           this.presentNextPermission();
         },
-        onExit: code => {
+        onExit: (code, diagnosis) => {
           const status = client.intentionalStop ? "stopped" : "failed";
           if (this.acp === client) {
             for (const renderer of this.acpRenderers.values()) {
@@ -2047,7 +2047,13 @@ class HermesSidebarProvider {
             vscode.window.showWarningMessage(`Unable to close Hermes confirmations after disconnect: ${error.message}`);
           });
           if (!client.intentionalStop && code) {
-            vscode.window.showWarningMessage(`Hermes ACP exited (code ${code}).`);
+            // A misconfigured hermesAgent.command exits 1 with only a shell
+            // "not recognized" line on stderr; say so instead of a bare code.
+            vscode.window.showWarningMessage(
+              diagnosis
+                ? `${diagnosis.reason}: ${diagnosis.detail} (code ${code}). Check the hermesAgent.command setting.`
+                : `Hermes ACP exited (code ${code}).`
+            );
           }
         },
         onStderr: line => {

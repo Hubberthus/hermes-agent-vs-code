@@ -209,8 +209,8 @@
   },
   "scripts": {
     "lint": "node scripts/check-syntax.js",
-    "test:unit": "node scripts/check-syntax.js",
-    "test": "npm run lint",
+    "test:unit": "node scripts/check-syntax.js && node scripts/test-acp-exit-diagnosis.js",
+    "test": "npm run lint && node scripts/test-acp-exit-diagnosis.js",
     "package": "vsce package --no-dependencies --no-rewrite-relative-links",
     "prepublishOnly": "npm run lint"
   },
