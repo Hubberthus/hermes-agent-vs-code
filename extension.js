@@ -265,6 +265,10 @@ class HermesSidebarProvider {
     // sessions; per-session mapping uiSession.id → acp session_id.
     this.acp = undefined;
     this.acpSessions = new Map();
+    // Which ACP client instance owns each uiSessionId -> acpSessionId mapping.
+    // A mapping restored from disk (or issued by an earlier ACP process) has no
+    // live owner, so it must be re-resumed rather than trusted as-is.
+    this.acpSessionOwners = new Map();
     for (const session of this.sessions) {
       if (session.acpSessionId) this.acpSessions.set(session.id, session.acpSessionId);
     }
@@ -1213,6 +1217,7 @@ class HermesSidebarProvider {
   applyAcpSessionState(session, acpSessionId, models, configOptions) {
     this.acpSessions.set(session.id, acpSessionId);
     session.acpSessionId = acpSessionId;
+    this.acpSessionOwners.set(session.id, this.acp);
     const runtimeModels = normalizeModelState(models);
     if (runtimeModels.options.length) session.modelState = runtimeModels;
     session.reasoningEffortSupported = true;
@@ -1249,27 +1254,43 @@ class HermesSidebarProvider {
 
   async ensureMappedAcpSession(client, session) {
     const mapped = this.acpSessions.get(session.id);
-    if (mapped) return mapped;
+    // Only a mapping THIS ACP process issued may be used as-is. After a restart
+    // the cached id is unknown to the new process: it answers session/prompt
+    // with "prompt: session <id> not found" and the turn dies as a bare
+    // "Hermes could not complete the request". Re-resume instead of trusting it.
+    if (mapped && this.acpSessionOwners.get(session.id) === client) return mapped;
 
-    const persisted = String(session.acpSessionId || "").trim();
+    const persisted = String(mapped || session.acpSessionId || "").trim();
     if (persisted && !this.retiredAcpSessions.has(persisted)) {
-      this.acpSessions.set(session.id, persisted);
       try {
         const resumed = await client.request("session/resume", {
           cwd: this.workspaceCwd(),
           sessionId: persisted,
           mcpServers: []
         });
-        this.applyAcpSessionState(session, persisted, resumed?.models, resumed?.configOptions);
-        return persisted;
+        // resume_session() silently creates a NEW session when the id is
+        // unknown, and ResumeSessionResponse carries no sessionId, so the
+        // provenance _meta is the only place the effective id appears. Trusting
+        // the requested id there would reproduce the same dead-id prompt.
+        const effective = String(resumed?._meta?.hermes?.sessionProvenance?.acpSessionId || "").trim();
+        const live = effective || persisted;
+        this.applyAcpSessionState(session, live, resumed?.models, resumed?.configOptions);
+        return live;
       } catch {
         if (this.acpSessions.get(session.id) === persisted) this.acpSessions.delete(session.id);
+        if (this.acpSessionOwners.get(session.id) === client) this.acpSessionOwners.delete(session.id);
         session.acpSessionId = "";
       }
+    } else if (persisted) {
+      // Retired by a fork/cancellation handoff: never resume it, and do not
+      // leave the dead id mapped to this session either.
+      this.acpSessions.delete(session.id);
+      this.acpSessionOwners.delete(session.id);
+      session.acpSessionId = "";
     }
 
     const created = await client.request("session/new", { cwd: this.workspaceCwd(), mcpServers: [], skip_memory: true });
-    const acpSessionId = String(created?.sessionId || "").trim();
+    const acpSessionId = String(created?.sessionId || created?.session_id || "").trim();
     if (!acpSessionId) throw new Error("Hermes did not return an ACP session");
     this.applyAcpSessionState(session, acpSessionId, created.models, created.configOptions);
     return acpSessionId;
@@ -2077,9 +2098,14 @@ class HermesSidebarProvider {
         },
         onDisconnect: () => {
           if (this.acp === client) this.acp = undefined;
+          // The transport is gone, so every id it issued is now stale. Keep the
+          // mappings (a reconnect may resume them) but drop ownership so the
+          // next turn re-resumes instead of prompting a dead id.
+          this.acpSessionOwners.clear();
         },
         onHostMigrated: async () => {
           this.acpSessions.clear();
+          this.acpSessionOwners.clear();
           this.acpAvailableCommands.clear();
           this.acpCommandCaptures.clear();
           await client.request("initialize", ACP_INITIALIZE_PARAMS);
@@ -2157,6 +2183,7 @@ class HermesSidebarProvider {
             this.acpCommandCaptures.clear();
             this.acp = undefined;
             this.acpSessions.clear();
+            this.acpSessionOwners.clear();
             this.retiredAcpSessions.clear();
             this.permissionSessionGrants.clear();
           }

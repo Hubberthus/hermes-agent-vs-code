@@ -210,7 +210,7 @@
   "scripts": {
     "lint": "node scripts/check-syntax.js",
     "test:unit": "node scripts/check-syntax.js && node scripts/test-acp-exit-diagnosis.js && node scripts/test-acp-stderr-grouping.js",
-    "test": "npm run lint && node scripts/test-acp-exit-diagnosis.js && node scripts/test-acp-stderr-grouping.js",
+    "test": "npm run lint && node scripts/test-acp-exit-diagnosis.js && node scripts/test-acp-stderr-grouping.js && node scripts/test-acp-stale-session.js",
     "package": "vsce package --no-dependencies --no-rewrite-relative-links",
     "prepublishOnly": "npm run lint"
   },
